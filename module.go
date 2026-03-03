@@ -88,10 +88,33 @@ func (h SentryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 	})
 
 	wrapped := sentryHandler.Handle(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Викликаємо наступний handler у ланцюжку
+		// Отримуємо поточний Hub (він вже встановлений sentryhttp.Handler)
+		hub := sentry.GetHubFromContext(r.Context())
+		if hub == nil {
+			hub = sentry.CurrentHub()
+		}
+
+		// Витягуємо trace та baggage для передачі далі
+		sentryTrace := hub.GetTraceparent() // або hub.Client().GetTraceparent(), якщо потрібно
+		baggage := hub.GetBaggage()
+
+		// Додаємо їх до запиту (щоб reverse_proxy міг їх скопіювати)
+		if sentryTrace != "" {
+			r.Header.Set(sentry.SentryTraceHeader, sentryTrace)
+		}
+		if baggage != "" {
+			r.Header.Set(sentry.SentryBaggageHeader, baggage)
+		}
+
+		// Якщо хочеш бачити в логах, що передаємо
+		h.logger.Debug("Propagating Sentry trace",
+			zap.String(sentry.SentryTraceHeader, sentryTrace),
+			zap.String(sentry.SentryBaggageHeader, baggage),
+		)
+
+		// Викликаємо наступний handler (reverse_proxy побачить оновлені заголовки)
 		err := next.ServeHTTP(w, r)
 		if err != nil {
-			// Caddy вже обробляє помилки, але можна додатково
 			sentry.CaptureException(err)
 		}
 	}))
