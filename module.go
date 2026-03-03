@@ -24,6 +24,7 @@ type SentryHandler struct {
 	Environment   string `json:"environment,omitempty"`
 	Release       string `json:"release,omitempty"`
 	EnableTracing bool   `json:"enable_tracing,omitempty"`
+	Name          string `json:"name,omitempty"`
 
 	client *sentry.Client
 	logger *zap.Logger
@@ -81,6 +82,10 @@ func (h SentryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 
 	localHub.ConfigureScope(func(scope *sentry.Scope) {
 		scope.SetRequest(r)
+		scope.SetUser(sentry.User{
+			Username:  h.Name,
+			IPAddress: r.RemoteAddr,
+		})
 	})
 
 	ctx := sentry.SetHubOnContext(r.Context(), localHub)
@@ -95,10 +100,11 @@ func (h SentryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 	wrapped := sentryHandler.Handle(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		span := sentry.SpanFromContext(r.Context())
 		if span != nil {
+			// Пропагація заголовків (використовуємо константи з sentry-go)
 			r.Header.Set(sentry.SentryTraceHeader, span.ToSentryTrace())
 			r.Header.Set(sentry.SentryBaggageHeader, span.ToBaggage())
 
-			// W3C traceparent — генеруємо вручну з даних спана
+			// W3C traceparent — генеруємо вручну
 			traceID := span.TraceID.String()
 			spanID := span.SpanID.String()
 			sampled := "00"
@@ -106,12 +112,12 @@ func (h SentryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 				sampled = "01"
 			}
 			traceparent := fmt.Sprintf("00-%s-%s-%s", traceID, spanID, sampled)
-			r.Header.Set("traceparent", traceparent)
+			r.Header.Set(sentry.TraceparentHeader, traceparent)
 
 			h.logger.Debug("Propagating tracing headers",
 				zap.String(sentry.SentryTraceHeader, span.ToSentryTrace()),
 				zap.String(sentry.SentryBaggageHeader, span.ToBaggage()),
-				zap.String("traceparent", traceparent),
+				zap.String(sentry.TraceparentHeader, traceparent),
 			)
 		}
 
@@ -127,6 +133,9 @@ func (h SentryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 func (h *SentryHandler) Validate() error {
 	if h.DSN == "" {
 		return fmt.Errorf("sentry: dsn обов'язковий")
+	}
+	if h.Name == "" {
+		return fmt.Errorf("sentry: name обов'язковий")
 	}
 	return nil
 }
@@ -164,6 +173,10 @@ func (h *SentryHandler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			}
 		case "release":
 			if !d.Args(&h.Release) {
+				return d.ArgErr()
+			}
+		case "name":
+			if !d.Args(&h.Name) {
 				return d.ArgErr()
 			}
 		case "tracing":
