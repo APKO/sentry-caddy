@@ -1,6 +1,7 @@
 package sentrycaddy
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
@@ -11,7 +12,6 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/getsentry/sentry-go"
-	sentryhttp "github.com/getsentry/sentry-go/http"
 	"go.uber.org/zap"
 )
 
@@ -39,7 +39,7 @@ func (SentryHandler) CaddyModule() caddy.ModuleInfo {
 }
 
 func (h *SentryHandler) Provision(ctx caddy.Context) error {
-	h.logger = ctx.Logger().With(zap.String("dsn", h.DSN))
+	h.logger = ctx.Logger().With(zap.String("name", h.Name))
 
 	if h.DSN == "" {
 		h.logger.Error("Sentry DSN is empty")
@@ -69,6 +69,7 @@ func (h *SentryHandler) Provision(ctx caddy.Context) error {
 	h.logger.Info("Sentry client successfully created",
 		zap.String("environment", h.Environment),
 		zap.Bool("tracing", h.EnableTracing),
+		zap.String("name", h.Name),
 	)
 	return nil
 }
@@ -80,11 +81,33 @@ func (h SentryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 	}
 
 	localHub := sentry.NewHub(h.client, sentry.NewScope())
+	ctx := sentry.SetHubOnContext(r.Context(), localHub)
+
+	opName := "http.server"
+	if r.Host != "" {
+		opName += " " + r.Host
+	}
+
+	spanOpts := []sentry.SpanOption{
+		sentry.ContinueTrace(localHub, r.Header.Get(sentry.SentryTraceHeader), r.Header.Get(sentry.SentryBaggageHeader)),
+		sentry.WithOpName(opName),
+		sentry.WithTransactionSource(sentry.SourceURL),
+		sentry.WithSpanOrigin("auto.http.caddy"),
+	}
+
+	tx := sentry.StartTransaction(ctx, getHTTPSpanName(r), spanOpts...)
+	tx.SetData("http.request.method", r.Method)
+	tx.SetData("http.request.host", r.Host)
+
+	ctx = tx.Context()
+	r = r.WithContext(ctx)
+
+	rw := wrapResponseWriter(w, r.ProtoMajor)
 
 	localHub.ConfigureScope(func(scope *sentry.Scope) {
 		scope.SetRequest(r)
-		clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
-		if err != nil {
+		clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
+		if clientIP == "" {
 			clientIP = r.RemoteAddr
 		}
 		scope.SetUser(sentry.User{
@@ -93,44 +116,96 @@ func (h SentryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 		})
 	})
 
-	ctx := sentry.SetHubOnContext(r.Context(), localHub)
-	r = r.WithContext(ctx)
+	// === ДОДАНО: передача tracing-заголовків на downstream (reverse_proxy тощо) ===
+	if tx != nil && h.EnableTracing {
+		r.Header.Set(sentry.SentryTraceHeader, tx.ToSentryTrace())
+		r.Header.Set(sentry.SentryBaggageHeader, tx.ToBaggage())
 
-	sentryHandler := sentryhttp.New(sentryhttp.Options{
-		Repanic:         true,
-		WaitForDelivery: false,
-		Timeout:         0,
-	})
+		// W3C traceparent (для максимальної сумісності з іншими системами)
+		traceparent := fmt.Sprintf("00-%s-%s-01", tx.TraceID.String(), tx.SpanID.String())
+		r.Header.Set(sentry.TraceparentHeader, traceparent)
 
-	wrapped := sentryHandler.Handle(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		span := sentry.SpanFromContext(r.Context())
-		if span != nil {
-			r.Header.Set(sentry.SentryTraceHeader, span.ToSentryTrace())
-			r.Header.Set(sentry.SentryBaggageHeader, span.ToBaggage())
+		h.logger.Debug("Propagating tracing headers to downstream",
+			zap.String(sentry.SentryTraceHeader, tx.ToSentryTrace()),
+			zap.String(sentry.SentryBaggageHeader, tx.ToBaggage()),
+			zap.String(sentry.TraceparentHeader, traceparent),
+		)
+	}
 
-			traceID := span.TraceID.String()
-			spanID := span.SpanID.String()
-			sampled := "00"
-			if span.Sampled.Bool() {
-				sampled = "01"
-			}
-			traceparent := fmt.Sprintf("00-%s-%s-%s", traceID, spanID, sampled)
-			r.Header.Set(sentry.TraceparentHeader, traceparent)
+	defer func() {
+		if tx != nil {
+			status := rw.Status()
+			tx.Status = sentry.HTTPtoSpanStatus(status)
+			tx.SetData("http.response.status_code", status)
+			tx.Finish()
+		}
 
-			h.logger.Debug("Propagating tracing headers",
-				zap.String(sentry.SentryTraceHeader, span.ToSentryTrace()),
-				zap.String(sentry.SentryBaggageHeader, span.ToBaggage()),
-				zap.String(sentry.TraceparentHeader, traceparent),
+		if rec := recover(); rec != nil {
+			eventID := localHub.RecoverWithContext(
+				context.WithValue(r.Context(), sentry.RequestContextKey, r),
+				rec,
 			)
+			if eventID != nil {
+				localHub.Flush(10 * time.Second)
+			}
+			panic(rec)
 		}
+	}()
 
-		if err := next.ServeHTTP(w, r); err != nil {
-			sentry.CaptureException(err)
-		}
-	}))
+	err := next.ServeHTTP(rw, r)
+	if err != nil {
+		localHub.CaptureException(err)
+	}
 
-	wrapped.ServeHTTP(w, r)
-	return nil
+	return err
+}
+
+func getHTTPSpanName(r *http.Request) string {
+	path := r.URL.Path
+	if r.URL.RawQuery != "" {
+		path += "?" + r.URL.RawQuery
+	}
+	return fmt.Sprintf("%s %s", r.Method, path)
+}
+
+type responseWrapper interface {
+	http.ResponseWriter
+	Status() int
+}
+
+type basicResponseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (b *basicResponseWriter) WriteHeader(code int) {
+	if b.status == 0 {
+		b.status = code
+	}
+	b.ResponseWriter.WriteHeader(code)
+}
+
+func (b *basicResponseWriter) Status() int {
+	if b.status == 0 {
+		return http.StatusOK
+	}
+	return b.status
+}
+
+type flushResponseWriter struct {
+	basicResponseWriter
+}
+
+func (f *flushResponseWriter) Flush() {
+	f.ResponseWriter.(http.Flusher).Flush()
+}
+
+func wrapResponseWriter(w http.ResponseWriter, protoMajor int) responseWrapper {
+	b := &basicResponseWriter{ResponseWriter: w}
+	if _, ok := w.(http.Flusher); ok {
+		return &flushResponseWriter{basicResponseWriter: *b}
+	}
+	return b
 }
 
 func (h *SentryHandler) Validate() error {
@@ -145,11 +220,10 @@ func (h *SentryHandler) Validate() error {
 
 func (h *SentryHandler) Cleanup() error {
 	if h.client != nil {
-		flushed := h.client.Flush(2 * time.Second)
-		if !flushed {
-			h.logger.Warn("Sentry flush timed out — some events may be lost")
+		if !h.client.Flush(2 * time.Second) {
+			h.logger.Warn("Sentry flush таймаут")
 		} else {
-			h.logger.Info("Sentry flush completed")
+			h.logger.Info("Sentry flush OK")
 		}
 	}
 	h.logger.Info("Sentry handler cleaned up")
@@ -157,47 +231,34 @@ func (h *SentryHandler) Cleanup() error {
 }
 
 func (h *SentryHandler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	if !d.Next() {
-		return d.Err("очікується директива 'sentry'")
-	}
-
-	for d.NextBlock(0) {
-		switch d.Val() {
-		case "dsn":
-			if !d.Args(&h.DSN) {
-				return d.ArgErr()
+	for d.Next() {
+		for d.NextBlock(0) {
+			switch d.Val() {
+			case "dsn":
+				if !d.Args(&h.DSN) {
+					return d.ArgErr()
+				}
+			case "environment":
+				d.Args(&h.Environment)
+			case "release":
+				d.Args(&h.Release)
+			case "name":
+				if !d.Args(&h.Name) {
+					return d.ArgErr()
+				}
+			case "tracing":
+				h.EnableTracing = true
+			default:
+				return d.Errf("невідома опція в sentry: %s", d.Val())
 			}
-			if d.NextArg() {
-				return d.Err("dsn приймає тільки один аргумент")
-			}
-		case "environment":
-			if !d.Args(&h.Environment) {
-				return d.ArgErr()
-			}
-		case "release":
-			if !d.Args(&h.Release) {
-				return d.ArgErr()
-			}
-		case "name":
-			if !d.Args(&h.Name) {
-				return d.ArgErr()
-			}
-		case "tracing":
-			h.EnableTracing = true
-			if d.NextArg() {
-				return d.Err("tracing не приймає аргументів")
-			}
-		default:
-			return d.Errf("невідома опція в sentry: %s", d.Val())
 		}
 	}
 	return nil
 }
 
 func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
-	var m SentryHandler
-	err := m.UnmarshalCaddyfile(h.Dispenser)
-	return &m, err
+	var s SentryHandler
+	return &s, s.UnmarshalCaddyfile(h.Dispenser)
 }
 
 var (
