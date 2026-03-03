@@ -2,6 +2,7 @@ package sentrycaddy
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"time"
 
@@ -82,9 +83,13 @@ func (h SentryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 
 	localHub.ConfigureScope(func(scope *sentry.Scope) {
 		scope.SetRequest(r)
+		clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			clientIP = r.RemoteAddr
+		}
 		scope.SetUser(sentry.User{
 			Username:  h.Name,
-			IPAddress: r.RemoteAddr,
+			IPAddress: clientIP,
 		})
 	})
 
@@ -100,11 +105,9 @@ func (h SentryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 	wrapped := sentryHandler.Handle(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		span := sentry.SpanFromContext(r.Context())
 		if span != nil {
-			// Пропагація заголовків (використовуємо константи з sentry-go)
 			r.Header.Set(sentry.SentryTraceHeader, span.ToSentryTrace())
 			r.Header.Set(sentry.SentryBaggageHeader, span.ToBaggage())
 
-			// W3C traceparent — генеруємо вручну
 			traceID := span.TraceID.String()
 			spanID := span.SpanID.String()
 			sampled := "00"
