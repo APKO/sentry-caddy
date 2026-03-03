@@ -139,6 +139,7 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 
 var (
 	_ caddy.Provisioner           = (*SentryHandler)(nil)
+	_ caddy.Validator             = (*SentryHandler)(nil)
 	_ caddyhttp.MiddlewareHandler = (*SentryHandler)(nil)
 	_ caddyfile.Unmarshaler       = (*SentryHandler)(nil)
 )
