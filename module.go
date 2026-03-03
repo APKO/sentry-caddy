@@ -11,6 +11,7 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/getsentry/sentry-go"
 	sentryhttp "github.com/getsentry/sentry-go/http"
+	"go.uber.org/zap"
 )
 
 func init() {
@@ -25,6 +26,7 @@ type SentryHandler struct {
 	Environment   string `json:"environment,omitempty"`
 	Release       string `json:"release,omitempty"`
 	EnableTracing bool   `json:"enable_tracing,omitempty"`
+	logger        *zap.Logger
 }
 
 // CaddyModule — реєстрація модуля
@@ -37,7 +39,14 @@ func (SentryHandler) CaddyModule() caddy.ModuleInfo {
 
 // Provision — ініціалізація (виконується один раз при старті)
 func (h *SentryHandler) Provision(ctx caddy.Context) error {
+	h.logger = ctx.Logger()
+	h.logger.Info("Sentry handler provisioned",
+		zap.String("dsn", h.DSN),
+		zap.String("environment", h.Environment),
+		zap.Bool("tracing", h.EnableTracing),
+	)
 	if h.DSN == "" {
+		h.logger.Error("Sentry DSN is empty — Sentry will not be initialized")
 		return fmt.Errorf("sentry: dsn is required")
 	}
 
@@ -57,14 +66,20 @@ func (h *SentryHandler) Provision(ctx caddy.Context) error {
 
 	err := sentry.Init(opts)
 	if err != nil {
+		h.logger.Error("Failed to initialize Sentry", zap.Error(err))
 		return fmt.Errorf("sentry init failed: %w", err)
 	}
-
+	h.logger.Info("Sentry successfully initialized")
 	return nil
 }
 
 // ServeHTTP — саме те, що потрібно: обгортаємо наступний handler
 func (h SentryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	h.logger.Debug("Handling request with Sentry",
+		zap.String("method", r.Method),
+		zap.String("path", r.URL.Path),
+		zap.String("remote_ip", r.RemoteAddr),
+	)
 	sentryHandler := sentryhttp.New(sentryhttp.Options{
 		// Тут можна налаштувати, що репортити
 		Repanic:         true,
@@ -94,7 +109,14 @@ func (h *SentryHandler) Validate() error {
 }
 
 func (h *SentryHandler) Cleanup() error {
-	sentry.Flush(2 * time.Second)
+	flushed := sentry.Flush(2 * time.Second)
+	if !flushed {
+		h.logger.Warn("Sentry flush timed out — some events may be lost")
+	} else {
+		h.logger.Info("Sentry flush completed successfully")
+	}
+
+	h.logger.Info("Sentry handler cleaned up")
 	return nil
 }
 
