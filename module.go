@@ -1,7 +1,6 @@
 package sentrycaddy
 
 import (
-	"context"
 	"fmt"
 	"net"
 	"net/http"
@@ -39,11 +38,10 @@ func (SentryHandler) CaddyModule() caddy.ModuleInfo {
 }
 
 func (h *SentryHandler) Provision(ctx caddy.Context) error {
-	h.logger = ctx.Logger().With(zap.String("name", h.Name))
+	h.logger = ctx.Logger().With(zap.String("handler_name", h.Name))
 
-	if h.DSN == "" {
-		h.logger.Error("Sentry DSN is empty")
-		return fmt.Errorf("sentry: dsn is required")
+	if h.DSN == "" || h.Name == "" {
+		return fmt.Errorf("sentry: dsn та name обов'язкові")
 	}
 
 	opts := sentry.ClientOptions{
@@ -80,29 +78,36 @@ func (h SentryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 		return next.ServeHTTP(w, r)
 	}
 
-	localHub := sentry.NewHub(h.client, sentry.NewScope())
-	ctx := sentry.SetHubOnContext(r.Context(), localHub)
-
-	opName := "http.server"
-	if r.Host != "" {
-		opName += " " + r.Host
+	// Спроба взяти існуючий hub — найчастіший кейс
+	localHub := sentry.GetHubFromContext(r.Context())
+	if localHub == nil {
+		localHub = sentry.NewHub(h.client, sentry.NewScope())
+		ctx := sentry.SetHubOnContext(r.Context(), localHub)
+		r = r.WithContext(ctx)
 	}
 
-	spanOpts := []sentry.SpanOption{
-		sentry.ContinueTrace(localHub, r.Header.Get(sentry.SentryTraceHeader), r.Header.Get(sentry.SentryBaggageHeader)),
-		sentry.WithOpName(opName),
-		sentry.WithTransactionSource(sentry.SourceURL),
-		sentry.WithSpanOrigin("auto.http.caddy"),
+	var tx *sentry.Span
+	if h.EnableTracing {
+		opName := "http.server"
+		if r.Host != "" {
+			opName += " " + r.Host
+		}
+
+		spanOpts := []sentry.SpanOption{
+			sentry.ContinueTrace(localHub, r.Header.Get(sentry.SentryTraceHeader), r.Header.Get(sentry.SentryBaggageHeader)),
+			sentry.WithOpName(opName),
+			sentry.WithTransactionSource(sentry.SourceURL),
+			sentry.WithSpanOrigin("auto.http.caddy"),
+		}
+
+		tx = sentry.StartTransaction(r.Context(), getSpanName(r), spanOpts...)
+		tx.SetData("http.method", r.Method)
+		tx.SetData("http.host", r.Host)
+
+		r = r.WithContext(tx.Context())
 	}
 
-	tx := sentry.StartTransaction(ctx, getHTTPSpanName(r), spanOpts...)
-	tx.SetData("http.request.method", r.Method)
-	tx.SetData("http.request.host", r.Host)
-
-	ctx = tx.Context()
-	r = r.WithContext(ctx)
-
-	rw := wrapResponseWriter(w, r.ProtoMajor)
+	rw := &statusCapturer{ResponseWriter: w}
 
 	localHub.ConfigureScope(func(scope *sentry.Scope) {
 		scope.SetRequest(r)
@@ -114,37 +119,28 @@ func (h SentryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 			Username:  h.Name,
 			IPAddress: clientIP,
 		})
+		scope.SetTag("handler.name", h.Name) // зручно фільтрувати в Sentry
 	})
 
-	// === ДОДАНО: передача tracing-заголовків на downstream (reverse_proxy тощо) ===
+	// Передача tracing-заголовків у upstream-запити
 	if tx != nil && h.EnableTracing {
 		r.Header.Set(sentry.SentryTraceHeader, tx.ToSentryTrace())
 		r.Header.Set(sentry.SentryBaggageHeader, tx.ToBaggage())
 
-		// W3C traceparent (для максимальної сумісності з іншими системами)
-		traceparent := fmt.Sprintf("00-%s-%s-01", tx.TraceID.String(), tx.SpanID.String())
+		// W3C traceparent — найпоширеніший стандарт
+		traceparent := "00-" + tx.TraceID.String() + "-" + tx.SpanID.String() + "-01"
 		r.Header.Set(sentry.TraceparentHeader, traceparent)
-
-		h.logger.Debug("Propagating tracing headers to downstream",
-			zap.String(sentry.SentryTraceHeader, tx.ToSentryTrace()),
-			zap.String(sentry.SentryBaggageHeader, tx.ToBaggage()),
-			zap.String(sentry.TraceparentHeader, traceparent),
-		)
 	}
 
 	defer func() {
 		if tx != nil {
-			status := rw.Status()
-			tx.Status = sentry.HTTPtoSpanStatus(status)
-			tx.SetData("http.response.status_code", status)
+			tx.Status = sentry.HTTPtoSpanStatus(rw.status)
+			tx.SetData("http.response.status_code", rw.status)
 			tx.Finish()
 		}
 
 		if rec := recover(); rec != nil {
-			eventID := localHub.RecoverWithContext(
-				context.WithValue(r.Context(), sentry.RequestContextKey, r),
-				rec,
-			)
+			eventID := localHub.RecoverWithContext(r.Context(), rec)
 			if eventID != nil {
 				localHub.Flush(10 * time.Second)
 			}
@@ -160,53 +156,40 @@ func (h SentryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 	return err
 }
 
-func getHTTPSpanName(r *http.Request) string {
+// ─────────────────────────────────────────────────────────────────────────────
+// Швидкі допоміжні функції без fmt.Sprintf
+// ─────────────────────────────────────────────────────────────────────────────
+
+func getSpanName(r *http.Request) string {
 	path := r.URL.Path
-	if r.URL.RawQuery != "" {
-		path += "?" + r.URL.RawQuery
+	if q := r.URL.RawQuery; q != "" {
+		path += "?" + q
 	}
-	return fmt.Sprintf("%s %s", r.Method, path)
+	return r.Method + " " + path
 }
 
-type responseWrapper interface {
-	http.ResponseWriter
-	Status() int
-}
-
-type basicResponseWriter struct {
+type statusCapturer struct {
 	http.ResponseWriter
 	status int
 }
 
-func (b *basicResponseWriter) WriteHeader(code int) {
-	if b.status == 0 {
-		b.status = code
+func (sc *statusCapturer) WriteHeader(code int) {
+	if sc.status == 0 {
+		sc.status = code
 	}
-	b.ResponseWriter.WriteHeader(code)
+	sc.ResponseWriter.WriteHeader(code)
 }
 
-func (b *basicResponseWriter) Status() int {
-	if b.status == 0 {
+func (sc *statusCapturer) Status() int {
+	if sc.status == 0 {
 		return http.StatusOK
 	}
-	return b.status
+	return sc.status
 }
 
-type flushResponseWriter struct {
-	basicResponseWriter
-}
-
-func (f *flushResponseWriter) Flush() {
-	f.ResponseWriter.(http.Flusher).Flush()
-}
-
-func wrapResponseWriter(w http.ResponseWriter, protoMajor int) responseWrapper {
-	b := &basicResponseWriter{ResponseWriter: w}
-	if _, ok := w.(http.Flusher); ok {
-		return &flushResponseWriter{basicResponseWriter: *b}
-	}
-	return b
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// Caddy-методи
+// ─────────────────────────────────────────────────────────────────────────────
 
 func (h *SentryHandler) Validate() error {
 	if h.DSN == "" {
