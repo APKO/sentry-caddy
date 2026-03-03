@@ -3,6 +3,7 @@ package sentrycaddy
 import (
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -41,9 +42,12 @@ func (h *SentryHandler) Provision(ctx caddy.Context) error {
 	}
 
 	opts := sentry.ClientOptions{
-		Dsn:         h.DSN,
-		Environment: h.Environment,
-		Release:     h.Release,
+		Dsn:              h.DSN,
+		Environment:      h.Environment,
+		Release:          h.Release,
+		EnableTracing:    true,
+		AttachStacktrace: true,
+		SendDefaultPII:   true,
 	}
 
 	// Якщо хочеш tracing (performance)
@@ -86,6 +90,11 @@ func (h *SentryHandler) Validate() error {
 	if h.DSN == "" {
 		return fmt.Errorf("sentry: dsn обов'язковий")
 	}
+	return nil
+}
+
+func (h *SentryHandler) Cleanup() error {
+	sentry.Flush(2 * time.Second)
 	return nil
 }
 
@@ -140,6 +149,7 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 var (
 	_ caddy.Provisioner           = (*SentryHandler)(nil)
 	_ caddy.Validator             = (*SentryHandler)(nil)
+	_ caddy.CleanerUpper          = (*SentryHandler)(nil)
 	_ caddyhttp.MiddlewareHandler = (*SentryHandler)(nil)
 	_ caddyfile.Unmarshaler       = (*SentryHandler)(nil)
 )
