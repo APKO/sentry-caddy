@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -111,13 +112,9 @@ func (h SentryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 
 	localHub.ConfigureScope(func(scope *sentry.Scope) {
 		scope.SetRequest(r)
-		clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
-		if clientIP == "" {
-			clientIP = r.RemoteAddr
-		}
 		scope.SetUser(sentry.User{
 			Username:  h.Name,
-			IPAddress: clientIP,
+			IPAddress: realIP(r),
 		})
 		scope.SetTag("handler.name", h.Name) // зручно фільтрувати в Sentry
 	})
@@ -162,9 +159,6 @@ func (h SentryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 
 func getSpanName(r *http.Request) string {
 	path := r.URL.Path
-	if q := r.URL.RawQuery; q != "" {
-		path += "?" + q
-	}
 	return r.Method + " " + path
 }
 
@@ -237,6 +231,30 @@ func (h *SentryHandler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		}
 	}
 	return nil
+}
+
+var trueClientIP = http.CanonicalHeaderKey("True-Client-IP")
+var xForwardedFor = http.CanonicalHeaderKey("X-Forwarded-For")
+var xRealIP = http.CanonicalHeaderKey("X-Real-IP")
+
+func realIP(r *http.Request) string {
+	var ip string
+
+	if tcip := r.Header.Get(trueClientIP); tcip != "" {
+		ip = tcip
+	} else if xrip := r.Header.Get(xRealIP); xrip != "" {
+		ip = xrip
+	} else if xff := r.Header.Get(xForwardedFor); xff != "" {
+		ip, _, _ = strings.Cut(xff, ",")
+	}
+	if ip == "" || net.ParseIP(ip) == nil {
+		clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
+		if clientIP == "" {
+			clientIP = r.RemoteAddr
+		}
+		return clientIP
+	}
+	return ip
 }
 
 func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
