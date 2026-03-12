@@ -145,9 +145,10 @@ type statusCapturer struct {
 }
 
 func (sc *statusCapturer) WriteHeader(code int) {
-	if sc.status == 0 {
-		sc.status = code
+	if sc.status != 0 {
+		return
 	}
+	sc.status = code
 	sc.ResponseWriter.WriteHeader(code)
 }
 
